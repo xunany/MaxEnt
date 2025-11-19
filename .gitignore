@@ -14,5 +14,5 @@ __pycache__/
 /*.sh				# all the sh files under the root folder
 /*.m
 /*.pt
-*.ipynb				# all the ipynb files
+/*.ipynb			# all the ipynb files
 !/./Real_data_cube.ipynb	# except this ipynb file
