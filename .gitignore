@@ -1,0 +1,7 @@
+# The following folders will be ignored
+Data/
+Notes/
+
+
+# The following cache will be ignored
+__pycache__/
