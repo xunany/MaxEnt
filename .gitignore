@@ -5,3 +5,9 @@ Notes/
 
 # The following cache will be ignored
 __pycache__/
+
+# The following files under the root folder will be ignored
+./*.py
+./*.sh
+./*.m
+./*.pt
