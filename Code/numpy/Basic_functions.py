@@ -2,7 +2,6 @@ import numpy as np
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.stats import gaussian_kde
 from petsc4py import PETSc
-import os
 import matplotlib.pyplot as plt
 from dipy.segment.mask import median_otsu
 from scipy import ndimage
@@ -283,7 +282,6 @@ def mask_brain(signal, median_radius = 1, numpass = 4, vol_idx = [0], least_size
         print("+-----------------------------------------------------------------------------+")
         print("Number of kept regions:", len(keep_labels) )
         print("Sizes of kept regions:", sizes[keep_labels])
-        print("+-----------------------------------------------------------------------------+")
 
         mask = np.isin(labels, keep_labels)                     # use the region pool to decide which voxels will be turned off  
 
@@ -319,7 +317,7 @@ def contourf_mask(theta1, theta2, f_hat, lin2idx, axis = 0, slice = 0):
     rows = shape[0]
     cols = shape[1]
 
-    fig, axs = plt.subplots(cols, rows, figsize=(2*rows, 2*cols)) 
+    fig, axs = plt.subplots(cols, rows, figsize=(1*rows, 1*cols)) 
     plt.subplots_adjust(wspace=0, hspace=0)
     theta11, theta22 = np.meshgrid(theta1, theta2)
 

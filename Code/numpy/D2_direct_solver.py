@@ -29,6 +29,9 @@ def data_check(qs, thetas, weights, Sqs, sigma, R, f0, f_hat = None):
 
     assert qs.ndim == 2 and qs.shape[1] == 2, "qs must be of shape (M, 2)"
 
+    if isinstance(sigma, np.ndarray) and sigma.ndim == 0:
+        sigma = sigma * np.ones(Sqs.shape[0] * qs.shape[0])
+
     if isinstance(sigma, np.ndarray):
         if not (sigma.ndim == 1 and sigma.size == Sqs.shape[0] * qs.shape[0]):
             raise ValueError("Size of sigma is not correct.")
