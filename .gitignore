@@ -1,13 +1,18 @@
-# The following folders will be ignored
+# The following folders will be ignored---------------------------------
+
 Data/
 Notes/
 
 
-# The following cache will be ignored
+# The following cache will be ignored-----------------------------------
+
 __pycache__/
 
-# The following files under the root folder will be ignored
-./*.py
-./*.sh
+# The following files under the root folder will be ignored-------------
+
+./*.py				# all the py files under the root folder
+./*.sh				# all the sh files under the root folder
 ./*.m
 ./*.pt
+*.ipynb				# all the ipynb files
+!/./Real_data_cube.ipynb	# except this ipynb file
