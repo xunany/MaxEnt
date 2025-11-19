@@ -11,4 +11,4 @@ __pycache__/
 
 
 # The following files will be ignored-----------------------------------
-# .DS_Store
+.DS_Store
