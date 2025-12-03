@@ -76,24 +76,58 @@ def loss_function(qs, thetas, weights, Sqs, R_csr, f_hat, sigma, f0):
 
     return first_term, second_term, third_term                                  # three scalars
 
-def f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize):
+# def f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize):
 
+#     """
+#     This function computes the pdf hat{f}_thetas given the dual variables Lambdas.
+
+#     Lambdas:        in shape (V, M)
+#     ker_mat:        in shape (M, N)
+#     weights:        in shape (N, )
+#     f0:             in shape (V, N)
+#     """
+#     V = Lambdas.shape[0]        # number of voxels
+#     N = ker_mat.shape[1]        # number of thetas
+
+#     f_hat = f0 * torch.exp(torch.clamp(- Lambdas @ ker_mat - 1, min=-700, max=700))     # in shape (V, N)
+
+#     if normalize:
+#         f_hat /= ((f_hat @ weights).unsqueeze(1).repeat(1, N))                          # normalize the pdf
+#     return f_hat
+
+def f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize):
     """
-    This function computes the pdf hat{f}_thetas given the dual variables Lambdas.
+    Numerically-stable computation of f_hat = f0 * exp(-Lambda @ K - 1) normalized
+    by the weighted sum with `weights`. Works voxel-wise.
+
+    By the way, I have to admit that it's ChatGPT who modifies this function.
+    It considers some underflow/overflow issues in my original function. 
 
     Lambdas:        in shape (V, M)
     ker_mat:        in shape (M, N)
     weights:        in shape (N, )
     f0:             in shape (V, N)
     """
-    V = Lambdas.shape[0]        # number of voxels
-    N = ker_mat.shape[1]        # number of thetas
 
-    f_hat = f0 * torch.exp(torch.clamp(- Lambdas @ ker_mat - 1, min=-700, max=700))     # in shape (V, N)
+    eps = 1e-300                                            # set a criterion to avoid log(0). No need to change it
 
-    if normalize:
-        f_hat /= ((f_hat @ weights).unsqueeze(1).repeat(1, N))                          # normalize the pdf
-    return f_hat
+    V = Lambdas.shape[0]
+    N = ker_mat.shape[1]
+
+    if not normalize:
+        f_hat = f0 * torch.exp(torch.clamp(-(Lambdas @ ker_mat) - 1.0, min=-700, max=700))
+        return f_hat
+    
+    else:                                                   # if normalize, we need to calculate the integral and might lead to overflow issues
+        log_f0 = torch.log(torch.clamp(f0, min=eps))        # in shape (V, N)
+        log_f_hat = log_f0 - (Lambdas @ ker_mat) - 1.0      # shape (V, N)
+
+        row_max = torch.max(log_f_hat, dim=1, keepdim=True).values  # in shape (V, 1) Return the per-row max
+        exp_shift = torch.exp(log_f_hat - row_max)          # in shape (V, N) Subtract per-row max for stability
+
+        denom = torch.clamp(exp_shift @ weights, min=eps)   # in shape (V, )  Calculate the integral after exp shifting. Clip it if too small
+        f_hat = exp_shift / denom.unsqueeze(1).repeat(1, N) # in shape (V, N)
+        return f_hat
 
 def negative_dual_function(Lambdas, ker_mat, weights, Sqs, sigma, R_csr, f0, normalize, rtol, atol, maxiter):
     """
@@ -135,10 +169,10 @@ def negative_dual_function(Lambdas, ker_mat, weights, Sqs, sigma, R_csr, f0, nor
     
     return first_term + second_term
 
-def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
-            Lambdas = None, rho = 1.0, rho_ratio = 3, dynamic_rho = False,
-            beta = 0.5, c = 1e-4, tol = 1e-6, epsilon = 1e-8, maxiter = 100, 
+def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True, Lambdas = None, 
+            beta = 0.5, c = 1e-4, epsilon = 1e-8, tol = 1e-6, maxiter = 100, 
             cg_rtol = 1e-10, cg_atol = 1e-50, cg_maxiter = 1000, 
+            rho = 1.0, rho_ratio = 3, dynamic_rho = False,
             admm_tol = 1e-8, admm_maxiter = 100):
     
     """
@@ -188,7 +222,7 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         return grad, hess
 
     def dist_Newton_Armijo( Lambdas, zs, us, rho, ker_mat, ker_prod, weights, f0, normalize,
-                            beta, c, tol, epsilon, maxiter):
+                            beta, c, epsilon, tol, maxiter):
         """
         Here the dist means distributed.
         Lambdas : in shape (V, M)
@@ -202,6 +236,9 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         active = torch.ones(V, dtype=torch.bool)                                                            # in shape (V, )
 
         loop = 0
+
+        iter_history = torch.zeros(V, dtype=bool)                                   # to store if Newton works in each voxel
+
         while True:
 
             grad, hess = dist_grad_hess(Lambdas, zs, us, rho, ker_mat, ker_prod, weights, f0, normalize)
@@ -240,10 +277,11 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
             obj_current = dist_obj(Lambdas, zs, us, rho, ker_mat, weights, f0, normalize)                   # in shape (V, )
 
             loop += 1
+            iter_history[active] = True
             if loop >= maxiter:
                 break
 
-        return Lambdas
+        return Lambdas, iter_history
 
     
     """
@@ -268,7 +306,6 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
     zs = torch.ones(V*M)                                                                        # in shape (V*M, )
     us = torch.ones(V*M)                                                                        # in shape (V*M, )
 
-
     Sigma_inv = torch.sparse_csr_tensor(
                 torch.arange(V*M + 1),
                 torch.arange(V*M),
@@ -287,6 +324,7 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
     primal_history = []
     dual_history = []
     rho_history = []
+    Newton_history = torch.zeros((V, admm_maxiter), dtype=bool)         # to store if Newton works in each voxel for each loop
 
     while True:
 
@@ -294,8 +332,8 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         update Lambdas ------------------------------------------------------------------------------------------------
         """
             
-        Lambdas = dist_Newton_Armijo(   Lambdas, zs.view(V, M), us.view(V, M), rho, ker_mat, ker_prod, weights, f0, normalize,
-                                        beta, c, tol, epsilon, maxiter)
+        Lambdas, Newton_history[:, loop]= dist_Newton_Armijo(   Lambdas, zs.view(V, M), us.view(V, M), rho, ker_mat, ker_prod, 
+                                                                weights, f0, normalize, beta, c, epsilon, tol, maxiter  )
         
         obj_history.append(
             negative_dual_function(Lambdas, ker_mat, weights, Sqs, sigma, R_csr, f0, normalize, cg_rtol, cg_atol, cg_maxiter)
@@ -348,7 +386,7 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
                 rho = rho / 2
                 us = us * 2
 
-        rho_history
+        rho_history.append(rho)
 
         """
         update us -----------------------------------------------------------------------------------------------------
@@ -360,8 +398,10 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         end -----------------------------------------------------------------------------------------------------------
         """
 
+    Newton_history = Newton_history[:, :loop]               # Unused part of Newton_history will be cropped
+
     f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize)
-    history = [obj_history, primal_history, dual_history]
+    history = [obj_history, primal_history, dual_history, rho_history, Newton_history]
     return Lambdas, f_hat, history                                
 
 def uncertainty(Lambdas, qs, thetas, weights, Sqs, sigma, R, f0, normalize):

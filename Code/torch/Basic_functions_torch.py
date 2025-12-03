@@ -198,7 +198,7 @@ def scipy_solver(A_csr, y, rtol=1e-10, atol = 1e-50, maxiter=1000):
 #   mask the real data
 #   ###############################################################################################
 
-def mask_brain(signal, median_radius = 1, numpass = 4, least_size = 300, keep_top = None):
+def mask_brain(signal, median_radius = 1, numpass = 4, vol_idx = [0], least_size = 300, keep_top = None):
     """
     signal:                 is a 4D torch tensor data, the first 3D are physical space, the last one is q-space
     least_size:             drop reagions with size smaller than least_size 
@@ -210,7 +210,7 @@ def mask_brain(signal, median_radius = 1, numpass = 4, least_size = 300, keep_to
                             median_radius=median_radius,
                             numpass=numpass,
                             autocrop=False,
-                            vol_idx=[0])
+                            vol_idx=vol_idx)
     
     if least_size > 1 or keep_top is not None:                  # drop regions with size smaller than least_size 
 
@@ -232,9 +232,20 @@ def mask_brain(signal, median_radius = 1, numpass = 4, least_size = 300, keep_to
         print("Number of kept regions:", len(keep_labels) )
         print("Sizes of kept regions:", sizes[keep_labels])
 
-        mask = np.isin(labels, keep_labels)                     # use the region pool to decide which voxels will be turned off               
+        mask = np.isin(labels, keep_labels)                     # use the region pool to decide which voxels will be turned off    
 
-    # -----------------------------------------------------
+    return torch.from_numpy(mask).to('cuda').bool()
+    
+
+def mask_to_lin2idx(mask):
+    """
+    This function was a part of mask_brain.
+    Then I realized that sometimes I want to modify mask manually and then regenerate lin2idx.
+    So, I make it an independent function.
+    """
+
+    mask = mask.detach().cpu().numpy()
+
     coords = np.argwhere(mask)
     N = coords.shape[0]
     shape = mask.shape
@@ -247,9 +258,7 @@ def mask_brain(signal, median_radius = 1, numpass = 4, least_size = 300, keep_to
     lin2idx_flat[lin_inds] = np.arange(N)
     lin2idx = lin2idx_flat.reshape(shape)              
 
-    return torch.from_numpy(mask).to('cuda').bool(), torch.from_numpy(lin2idx).to('cuda')
-
-
+    return torch.from_numpy(lin2idx).to('cuda')
 
 
 

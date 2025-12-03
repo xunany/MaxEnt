@@ -79,6 +79,7 @@ def compare_KL(f_num, f_den, weights):
     return np.sum(  weights * (f_num * np.log( np.maximum(f_num / np.maximum(f_den, 1e-30), 1e-30) ) ), 
                     axis = 0 if f_num.ndim == 1 else 1 )                            # a scalar if 1D or shape (V, ) if 2D
 
+
 def compare_L2(f_a, f_b, weights = None):
     """
     This function computes the L2 distance between two pdfs and the orders do not matter.
@@ -91,6 +92,118 @@ def compare_L2(f_a, f_b, weights = None):
         weights = np.ones_like(f_a[0])
     assert f_a.ndim == f_b.ndim, "Dimensions of f_a and f_b must match"
     return np.sqrt(np.sum(weights * ((f_a - f_b) ** 2), axis = 0 if f_a.ndim == 1 else 1))  # a scalar if f_a is 1D or shape (V, ) if 2D
+
+#   ###############################################################################################
+#   inverse or solve a linear system with a symmetric positive definite matrix
+#   ###############################################################################################
+
+def chol_solver(A, y = None):
+    """
+    This function solves the linear system Ax = y using Cholesky factorization.
+    If y is None, it computes the inverse of A.
+    Here the solver is designed for small dimension spd A.
+    The form of A is dense.
+    """
+    if y is None:                                           # If y is None, we want to compute the inverse of A
+        c, lower = cho_factor(A)
+        x = cho_solve((c, lower), np.eye(A.shape[0]))
+    else:                                                   # If y is provided, we want to solve the linear system Ax = y
+        c, lower = cho_factor(A)
+        x = cho_solve((c, lower), y)
+    return x
+
+def PETSc_solver(A_csr, y, rtol = 1e-10, atol = 1e-50, maxiter = 1000):
+    """
+    This function solves the linear system Ax = y using cg method from PETSc package.
+    Here the solver is designed for huge dimension spd A.
+    The form of A is scipy csr sparse matrix.
+    """
+    A_PETSc = PETSc.Mat().createAIJ(size=A_csr.shape, csr=(A_csr.indptr, A_csr.indices, A_csr.data))
+    A_PETSc.assemblyBegin(); A_PETSc.assemblyEnd()
+
+    b = PETSc.Vec().createWithArray(y)
+    x = b.duplicate()
+
+    ksp = PETSc.KSP().create()
+    ksp.setOperators(A_PETSc)
+    ksp.setType('cg')
+    ksp.getPC().setType('hypre') 
+    ksp.setTolerances(rtol, atol, maxiter)
+    ksp.setFromOptions()
+    ksp.solve(b, x)
+
+    return x.getArray()
+
+#   ###############################################################################################
+#   solve Q^{-1/2} z given Q and z
+#   ###############################################################################################
+
+def chol_sample(Q, z):
+    L = np.linalg.cholesky(Q)
+    x = solve_triangular(L.T, z, lower=False)
+    return x
+
+#   ###############################################################################################
+#   mask the real data
+#   ###############################################################################################
+
+def mask_brain(signal, median_radius = 1, numpass = 4, vol_idx = [0], least_size = 300, keep_top = None):
+    """
+    signal:                 is a 4D numpy array data, the first 3D are physical space, the last one is q-space
+    least_size:             drop reagions with size smaller than least_size 
+    keep_top:               keep only top 2 or 3 big regions. If None, skip
+    """
+
+    _, mask = median_otsu(  signal,
+                            median_radius=median_radius,
+                            numpass=numpass,
+                            autocrop=False,
+                            vol_idx=vol_idx)
+    
+    if least_size > 1 or keep_top is not None:                  # drop regions with size smaller than least_size 
+
+        structure = ndimage.generate_binary_structure(3, 1)     # the last place can only be 1, 2, 3
+                                                                # 1, 2, 3 corresponds to 6, 18, 26 respectively
+
+        labels, nlb = ndimage.label(mask, structure=structure)  # identify the seperate regions of the mask, labeled with 0, 1, 2
+        sizes = np.bincount(labels.ravel())                     # count the size of each region 0, region 1, region 2
+        print("+-----------------------------------------------------------------------------+")
+        print("Number of initial valid regions:", nlb)
+        print("Sizes of each regions (1st is background):", sizes)
+
+        keep_labels = np.where(sizes >= least_size)[0]          # return a pool to decide which region are kept, like [0, 2]
+        keep_labels = keep_labels[keep_labels != 0]             # drop the original False voxels
+
+        if keep_top is not None:                                # keep only first keep_top regions
+            keep_labels = np.where(np.isin(sizes, np.sort(sizes[keep_labels])[::-1][0:keep_top]))[0]
+        print("+-----------------------------------------------------------------------------+")
+        print("Number of kept regions:", len(keep_labels) )
+        print("Sizes of kept regions:", sizes[keep_labels])
+
+        mask = np.isin(labels, keep_labels)                     # use the region pool to decide which voxels will be turned off  
+
+    return mask
+
+def mask_to_lin2idx(mask):
+    """
+    This function was a part of mask_brain.
+    Then I realized that sometimes I want to modify mask manually and then regenerate lin2idx.
+    So, I make it an independent function.
+    """
+
+    coords = np.argwhere(mask)
+    N = coords.shape[0]
+    shape = mask.shape
+
+    # lin2idx: a 3D array storing the order of mask==True voxels in the coordinate system of the smallest cube
+
+    lin2idx = -np.ones(shape, dtype=int)
+    lin_inds = np.ravel_multi_index(coords.T, dims=shape, order='C')
+    lin2idx_flat = lin2idx.ravel()
+    lin2idx_flat[lin_inds] = np.arange(N)
+    lin2idx = lin2idx_flat.reshape(shape)
+
+    return lin2idx
 
 #   ###############################################################################################
 #   plot recovered pdf, the true pdf and S(q)
@@ -184,9 +297,9 @@ def contourf_compare(theta1, theta2, f_hat = None, qs = None, Sqs = None, f_true
     if qs is not None and Sqs is not None:
         thetas, weights = Cartesian(theta1, theta2)
         ker_mat = kernel(qs, thetas)
-        axs[sub_index].plot(Sqs, 'o', markersize = 10, color = 'gray', alpha = 1, label = 'Observed True')
+        axs[sub_index].plot(Sqs, 'o', markersize = 10, color = 'gray', alpha = 1, label = 'Observed')
         if f_true is not None:
-            axs[sub_index].plot(get_Sqs(ker_mat, weights, f_true), 'x', markersize = 5, markeredgewidth=1, color = 'blue', alpha = 1, label = 'Noisefree True')
+            axs[sub_index].plot(get_Sqs(ker_mat, weights, f_true), 'x', markersize = 5, markeredgewidth=1, color = 'blue', alpha = 1, label = 'Ground truth')
         axs[sub_index].plot(get_Sqs(ker_mat, weights, f_hat), '.', markersize = 3, color = 'red', alpha = 1, label='Recovered')
         axs[sub_index].set_ylabel('S(q)')
         axs[sub_index].set_xlabel('q')
@@ -196,109 +309,6 @@ def contourf_compare(theta1, theta2, f_hat = None, qs = None, Sqs = None, f_true
         plt.savefig(savepath, format='pdf', bbox_inches='tight')
     plt.show()
 
-#   ###############################################################################################
-#   inverse or solve a linear system with a symmetric positive definite matrix
-#   ###############################################################################################
-
-def chol_solver(A, y = None):
-    """
-    This function solves the linear system Ax = y using Cholesky factorization.
-    If y is None, it computes the inverse of A.
-    Here the solver is designed for small dimension spd A.
-    The form of A is dense.
-    """
-    if y is None:                                           # If y is None, we want to compute the inverse of A
-        c, lower = cho_factor(A)
-        x = cho_solve((c, lower), np.eye(A.shape[0]))
-    else:                                                   # If y is provided, we want to solve the linear system Ax = y
-        c, lower = cho_factor(A)
-        x = cho_solve((c, lower), y)
-    return x
-
-def PETSc_solver(A_csr, y, rtol = 1e-10, atol = 1e-50, maxiter = 1000):
-    """
-    This function solves the linear system Ax = y using cg method from PETSc package.
-    Here the solver is designed for huge dimension spd A.
-    The form of A is scipy csr sparse matrix.
-    """
-    A_PETSc = PETSc.Mat().createAIJ(size=A_csr.shape, csr=(A_csr.indptr, A_csr.indices, A_csr.data))
-    A_PETSc.assemblyBegin(); A_PETSc.assemblyEnd()
-
-    b = PETSc.Vec().createWithArray(y)
-    x = b.duplicate()
-
-    ksp = PETSc.KSP().create()
-    ksp.setOperators(A_PETSc)
-    ksp.setType('cg')
-    ksp.getPC().setType('hypre') 
-    ksp.setTolerances(rtol, atol, maxiter)
-    ksp.setFromOptions()
-    ksp.solve(b, x)
-
-    return x.getArray()
-
-#   ###############################################################################################
-#   solve Q^{-1/2} z given Q and z
-#   ###############################################################################################
-
-def chol_sample(Q, z):
-    L = np.linalg.cholesky(Q)
-    x = solve_triangular(L.T, z, lower=False)
-    return x
-
-#   ###############################################################################################
-#   mask the real data
-#   ###############################################################################################
-
-def mask_brain(signal, median_radius = 1, numpass = 4, vol_idx = [0], least_size = 300, keep_top = None):
-    """
-    signal:                 is a 4D numpy array data, the first 3D are physical space, the last one is q-space
-    least_size:             drop reagions with size smaller than least_size 
-    keep_top:               keep only top 2 or 3 big regions. If None, skip
-    """
-
-    _, mask = median_otsu(  signal,
-                            median_radius=median_radius,
-                            numpass=numpass,
-                            autocrop=False,
-                            vol_idx=vol_idx)
-    
-    if least_size > 1 or keep_top is not None:                  # drop regions with size smaller than least_size 
-
-        structure = ndimage.generate_binary_structure(3, 1)     # the last place can only be 1, 2, 3
-                                                                # 1, 2, 3 corresponds to 6, 18, 26 respectively
-
-        labels, nlb = ndimage.label(mask, structure=structure)  # identify the seperate regions of the mask, labeled with 0, 1, 2
-        sizes = np.bincount(labels.ravel())                     # count the size of each region 0, region 1, region 2
-        print("+-----------------------------------------------------------------------------+")
-        print("Number of initial valid regions:", nlb)
-        print("Sizes of each regions (1st is background):", sizes)
-
-        keep_labels = np.where(sizes >= least_size)[0]          # return a pool to decide which region are kept, like [0, 2]
-        keep_labels = keep_labels[keep_labels != 0]             # drop the original False voxels
-
-        if keep_top is not None:                                # keep only first keep_top regions
-            keep_labels = np.where(np.isin(sizes, np.sort(sizes[keep_labels])[::-1][0:keep_top]))[0]
-        print("+-----------------------------------------------------------------------------+")
-        print("Number of kept regions:", len(keep_labels) )
-        print("Sizes of kept regions:", sizes[keep_labels])
-
-        mask = np.isin(labels, keep_labels)                     # use the region pool to decide which voxels will be turned off  
-
-    # -----------------------------------------------------
-    coords = np.argwhere(mask)
-    N = coords.shape[0]
-    shape = mask.shape
-
-    # lin2idx: a 3D array storing the order of mask==True voxels in the coordinate system of the smallest cube
-
-    lin2idx = -np.ones(shape, dtype=int)
-    lin_inds = np.ravel_multi_index(coords.T, dims=shape, order='C')
-    lin2idx_flat = lin2idx.ravel()
-    lin2idx_flat[lin_inds] = np.arange(N)
-    lin2idx = lin2idx_flat.reshape(shape)                        
-
-    return mask, lin2idx
 
 #   ###############################################################################################
 #   plot the results from the masked data
@@ -338,8 +348,10 @@ def contourf_mask(theta1, theta2, f_hat, lin2idx, axis = 0, slice = 0):
                 ax.contourf(theta11, theta22, 
                             f_hat[lin2idx[tuple(index)], :].reshape(theta11.shape, order='F'), 
                             levels=50, cmap='hot')
-                # ax.axhline(y=0, color='white', linestyle='-', linewidth=1.2)
-                # ax.axvline(x=0, color='white', linestyle='-', linewidth=0.5)
+                ax.text(0.05, 0.95, lin2idx[tuple(index)], transform=ax.transAxes, 
+                            va='top', ha='left', color='white', fontsize=6)
+                ax.axhline(y=0, color='white', linestyle='-', linewidth=1.2)
+                ax.axvline(x=0, color='white', linestyle='-', linewidth=0.5)
                 ax.axis("off")
     # plt.savefig(os.path.expanduser('~/Desktop/MRI.png'), format='png')
     plt.show()
