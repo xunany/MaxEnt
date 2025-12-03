@@ -14,5 +14,5 @@ nvidia-smi                                                  ## this returns the 
 source /work/xunan/tools/miniconda3/etc/profile.d/conda.sh
 conda activate torch_118
 
-python /work/xunan/MaxEnt/HPC_Post_Process.py
+python /work/xunan/MaxEnt/HPC_Pre_Process.py               ## put the code need to run here
 
