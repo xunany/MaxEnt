@@ -54,7 +54,7 @@ R25 = rrt.R_mask(mask, 25, order=2)
 
 t0 = time.perf_counter()
 
-lambdas, f_hat, history = dast.admm(   	qs, thetas, weights, Sqs[mask, :], sigma = 0.5*sigma,
+lambdas, f_hat, history = dast.admm(   	qs, thetas, weights, Sqs[mask, :], sigma = 1.0*sigma,
 										R_csr = R0, f0 = None, normalize = True, Lambdas = None, 
 										beta = 0.5, c = 1e-4, epsilon = 1e-8, tol = 1e-12, maxiter = 1,
 										cg_rtol = 1e-10, cg_atol = 1e-50, cg_maxiter = 1000,
