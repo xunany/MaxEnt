@@ -30,6 +30,7 @@ conda install -c conda-forge nibabel numpy scipy scikit-sparse dipy petsc petsc4
 ## Libraries
 
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+
 conda install -c conda-forge cupy cuda-version=11.8
 
 conda install -c conda-forge nibabel numpy scipy scikit-sparse dipy petsc petsc4py
