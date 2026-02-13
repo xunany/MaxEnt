@@ -6,7 +6,7 @@ import importlib
 sys.path.append("/work/xunan/MaxEnt/Code")
 import Basic_functions_torch
 importlib.reload(Basic_functions_torch)
-from Basic_functions_torch import kernel, get_Sqs, chol_solver, cupy_solver, scipy_solver, compare_KL
+from Basic_functions_torch import kernel, get_Sqs, cupy_solver, PETSc_solver, compare_KL # 
 
 def data_check(qs, thetas, weights, Sqs, sigma, R_csr, f0, f_hat = None):
     """
@@ -169,14 +169,97 @@ def negative_dual_function(Lambdas, ker_mat, weights, Sqs, sigma, R_csr, f0, nor
     
     return first_term + second_term
 
+def gradient_hessian(Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, f0, normalize, rtol, atol, maxiter, blocked = False):
+    """
+    This function computes the gradient and the hessian matrix for the negative dual function.
+    It has no use to solving ADMM.
+    It can be used in returning the blocked hessian matrix given the optimum of Lambdas,
+    which is needed in generalized corss validation.
+
+    Lambdas:    in shape (V, M)
+    ker_mat:    in shape (M, N)
+    ker_prod:   in shape (M, M, N)
+    weights:    in shape (N, )
+    Sqs:        in shape (V, M)
+    f0:         in shape (V, N)
+
+    blocked:    if True, only return blocked hess by assuming Lambdas is already optimal and gradient nearly == 0.
+                And no matter what R_csr is, it will be treated as all zeros, i.e., no spatial smoothness is considered.
+                blocked_hess is meaningful only if the optimizer is solved with R_csr == 0.
+                However, it still can be returned even if not. Keep that in mind and be careful.
+    """
+    V = Sqs.shape[0]        # number of voxels
+    M = ker_mat.shape[0]    # number of qs
+    N = ker_mat.shape[1]    # number of thetas
+        
+    Sigma_diag = (sigma**2) * torch.ones(V*M)                                               # in shape (V*M, )
+
+    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize = normalize)              # in shape (V, N)
+    f_weights = f_hat * weights.view(1, -1)                                                 # in shape (V, N)
+    grad1 = - f_weights.matmul(ker_mat.T)                                                   # in shape (V, M)
+
+    hess_blocked = torch.tensordot(f_weights, ker_prod, dims=([1], [2]))                    # in shape (V, M, M)
+
+    if normalize:
+        hess_blocked -= grad1[:, :, None] * grad1[:, None, :]                               # in shape (V, M, M)
+
+    if blocked:
+        hess_blocked += torch.eye(M)[None, :, :] * Sigma_diag.reshape(V, M)[:, :, None]     # in shape (V, M, M)
+        return hess_blocked
+    
+    # rSqs = Sqs.reshape(-1)                                                                  # in shape (V*M, )
+    # rLambdas = Lambdas.reshape(-1)                                                          # in shape (V*M, )
+
+    # Sigma_inv_diag = (1 / (sigma ** 2)) * torch.ones(V * M)                                 # in shape (V*M, )
+    
+    # middle_matrix = torch.sparse_csr_tensor(
+    #                     torch.arange(V*M + 1),
+    #                     torch.arange(V*M),
+    #                     (1.0 / (sigma**2)),
+    #                     size=(V*M, V*M)  ) + R_csr                                          # in shape (V*M, V*M)
+    # side_vector = Sigma_inv_diag * rSqs + rLambdas                                          # in shape (V*M, )
+    
+    # if R_csr.values().numel() == 0:
+    #     grad2 = rSqs + Sigma_diag * rLambdas                                                # in shape (V*M, )
+    # else:
+    #     grad2 = cupy_solver(middle_matrix, side_vector, rtol, atol, maxiter)                # in shape (V*M, )
+
+    # gradient = - grad1.reshape(-1) + grad2                                                  # in shape (V*M, )
+
+    # hess = torch.block_diag(*[hess_blocked[i] for i in range(V)])                           # in shape (V*M, V*M)
+
+    # indptr = torch.arange(0, V * M * M + 1, M)
+    # row_ids = torch.arange(V * M)
+    # indices = (row_ids // M)[:, None] * M + torch.arange(M)[None, :]
+
+    # values = hess_blocked[ row_ids // M, row_ids % M, torch.arange(M)[None, :] ]
+
+    # hess = torch.sparse_csr_tensor(
+    #     indptr,
+    #     indices.reshape(-1),
+    #     values.reshape(-1),
+    #     size=(V * M, V * M) )                                                               # in shape (V*M, V*M)
+
+    # if R_csr.values().numel() == 0:
+    #     hess = hess + torch.diag(Sigma_diag)                                                # in shape (V*M, V*M)
+    # else:
+    #     hess = hess + cupy_solver(middle_matrix)                                            # in shape (V*M, V*M)
+
+    # return gradient, hess
+
 def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True, Lambdas = None, 
             beta = 0.5, c = 1e-4, epsilon = 1e-8, tol = 1e-6, maxiter = 100, 
             cg_rtol = 1e-10, cg_atol = 1e-50, cg_maxiter = 1000, 
             rho = 1.0, rho_ratio = 3, dynamic_rho = False,
-            admm_tol = 1e-8, admm_maxiter = 100):
+            admm_tol = 1e-8, admm_maxiter = 100,
+            return_hess = False):
     
     """
-    rho_ratio: should be strictly greater than 1
+    rho_ratio:  should be strictly greater than 1
+    keep_hess:  If use generalized cross validation, hess needs to be returned.
+                If do voxel-wise gcv for just alpha(s), set R_csr to empty please, and it returns "blocked_hess".
+                If do gcv for both (alpha, if needed) beta, no requirement to R_csr, and it still returns "blocked_hess",
+                but notice that "blocked hess" is not the final hess in that case.
     """
     
     def dist_obj(Lambdas, zs, us, rho, ker_mat, weights, f0, normalize):
@@ -282,7 +365,6 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
                 break
 
         return Lambdas, iter_history
-
     
     """
     start -------------------------------------------------------------------------------------------------------------
@@ -345,14 +427,20 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         update zs -----------------------------------------------------------------------------------------------------
         """
 
-        mat_A = torch.sparse_csr_tensor(
-                    torch.arange(V*M + 1), 
-                    torch.arange(V*M),     
-                    torch.ones(V*M),             
-                    size=(V*M, V*M)    ) + rho * (Sigma_inv + R_csr)
-        vec_y = rho * (Sigma_inv + R_csr) @ (Lambdas.reshape(-1) + us) - (Sigma_inv @ Sqs.reshape(-1))
+        if R_csr.values().numel() == 0:
+            vec_y = rho / (sigma**2) * (Lambdas.reshape(-1) + us) - ( Sqs.reshape(-1) / (sigma**2) )
+            zs_new = vec_y / ( torch.tensor(1.0) + rho / (sigma**2) )
 
-        zs_new = cupy_solver(mat_A, vec_y, rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
+        else:
+
+            mat_A = torch.sparse_csr_tensor(
+                        torch.arange(V*M + 1), 
+                        torch.arange(V*M),     
+                        torch.ones(V*M),             
+                        size=(V*M, V*M)    ) + rho * (Sigma_inv + R_csr)
+            vec_y = rho * (Sigma_inv + R_csr) @ (Lambdas.reshape(-1) + us) - (Sigma_inv @ Sqs.reshape(-1))
+
+            zs_new = cupy_solver(mat_A, vec_y, rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter)
 
         """
         check convergence ---------------------------------------------------------------------------------------------
@@ -398,10 +486,17 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         end -----------------------------------------------------------------------------------------------------------
         """
 
+    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize)
+
     Newton_history = Newton_history[:, :loop]               # Unused part of Newton_history will be cropped
 
-    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize)
     history = [obj_history, primal_history, dual_history, rho_history, Newton_history]
+
+    if return_hess:
+        final_blocked_hess = gradient_hessian(  Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, 
+                                                f0, normalize, cg_rtol, cg_atol, cg_maxiter, blocked = True)
+        history.append(final_blocked_hess)
+    
     return Lambdas, f_hat, history                                
 
 def uncertainty(Lambdas, qs, thetas, weights, Sqs, sigma, R, f0, normalize):

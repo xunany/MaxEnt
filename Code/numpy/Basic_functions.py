@@ -2,9 +2,13 @@ import numpy as np
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.stats import gaussian_kde
 from petsc4py import PETSc
-import matplotlib.pyplot as plt
 from dipy.segment.mask import median_otsu
 from scipy import ndimage
+from pylops.utils.estimators import trace_hutchpp
+from scipy.sparse.linalg import LinearOperator
+from sksparse.cholmod import cholesky
+
+import matplotlib.pyplot as plt
 
 def explain_this_module():
     """
@@ -37,8 +41,13 @@ def Cartesian(theta1, theta2):
     theta11, theta22 = np.meshgrid(theta1, theta2)
     thetas = np.vstack([theta11.flatten(order='F'), theta22.flatten(order='F')]).T  # in shape (n1*n2, 2)
 
-    delta1 = np.gradient(theta1)                                                    # in shape (n1,)
-    delta2 = np.gradient(theta2)                                                    # in shape (n2,)
+    def delta(theta):   
+        # given a series of points, divide the whole long space into n pieces without overlap and gaps
+        points = np.concatenate([   [theta[0]], 0.5*(theta[:-1] + theta[1:]), [theta[-1]]   ])
+        return np.diff(points)
+
+    delta1 = delta(theta1)                                                    # in shape (n1,)
+    delta2 = delta(theta2)                                                    # in shape (n2,)
 
     weights = np.outer(delta1, delta2).reshape(-1, order = 'C')                     # in shape (n1*n2, )
 
@@ -48,6 +57,11 @@ def kernel(qs, thetas):
     """
     This function computes the kernel matrix for the given qs and thetas.
     """
+    ######################################################################################################
+    thetas = thetas.copy()          ########################## Just for comparison of Haldar's code
+    thetas[:, 1] = 1 / thetas[:, 1] ########################## Just for comparison of Haldar's code
+    ######################################################################################################
+
     return np.exp( - qs @ thetas.T )                                                # in shape (M, N). M = qs.shape[0], N = thetas.shape[0]
 
 def get_Sqs(ker_mat, weights, f_thetas, sigma = 0):
@@ -77,7 +91,7 @@ def compare_KL(f_num, f_den, weights):
     """
     assert f_num.ndim == f_den.ndim, "Dimensions of f_num and f_den must match"
     return np.sum(  weights * (f_num * np.log( np.maximum(f_num / np.maximum(f_den, 1e-30), 1e-30) ) ), 
-                    axis = 0 if f_num.ndim == 1 else 1 )                            # a scalar if 1D or shape (V, ) if 2D
+                    axis = 0 if f_num.ndim == 1 else 1 )                            # a scalar or shape (V, )
 
 
 def compare_L2(f_a, f_b, weights = None):
@@ -89,9 +103,22 @@ def compare_L2(f_a, f_b, weights = None):
     weights:    in shape (N, ), the weights of the quadrature. If None, it is assumed to be all ones.
     """
     if weights is None:
-        weights = np.ones_like(f_a[0])
+        weights = np.ones_like(f_a if f_a.ndim == 1 else f_a[0])
     assert f_a.ndim == f_b.ndim, "Dimensions of f_a and f_b must match"
-    return np.sqrt(np.sum(weights * ((f_a - f_b) ** 2), axis = 0 if f_a.ndim == 1 else 1))  # a scalar if f_a is 1D or shape (V, ) if 2D
+    return np.sqrt(np.sum(weights * ((f_a - f_b) ** 2), axis = 0 if f_a.ndim == 1 else 1))  # a scalar or shape (V, )
+
+def compare_He(f_a, f_b, weights = None):
+    """
+    This function computes the Hellinger distance between two pdfs and the orders do not matter.
+    
+    f_a:        in shape (N, ) or shape (V, N), the pdf in the first argument
+    f_b:        in shape (N, ) or shape (V, N), the pdf in the second argument
+    weights:    in shape (N, ), the weights of the quadrature. If None, it is assumed to be all ones.
+    """
+    if weights is None:
+        weights = np.ones_like(f_a if f_a.ndim == 1 else f_a[0])
+    assert f_a.ndim == f_b.ndim, "Dimensions of f_a and f_b must match"
+    return np.sqrt(np.sum(weights * ((np.sqrt(f_a) - np.sqrt(f_b)) ** 2), axis = 0 if f_a.ndim == 1 else 1))/np.sqrt(2.0)  # a scalar or shape (V, )
 
 #   ###############################################################################################
 #   inverse or solve a linear system with a symmetric positive definite matrix
@@ -134,14 +161,32 @@ def PETSc_solver(A_csr, y, rtol = 1e-10, atol = 1e-50, maxiter = 1000):
 
     return x.getArray()
 
+def hutchpp_inv(A_csr, neval = 50):
+    factor = cholesky(A_csr.tocsc())
+    def Ainverse_matvec(v):
+        return factor.solve_A(v)
+    Ainv_op = LinearOperator(A_csr.shape, matvec=Ainverse_matvec)
+
+    return trace_hutchpp(Ainv_op, neval = neval)
+
 #   ###############################################################################################
-#   solve Q^{-1/2} z given Q and z
+#   solve P^{-1/2} z given P and z
 #   ###############################################################################################
 
-def chol_sample(Q, z):
-    L = np.linalg.cholesky(Q)
-    x = solve_triangular(L.T, z, lower=False)
-    return x
+def chol_sample(Lambdas, P_csr):
+    """
+    Given the precision matrix of a multivariate normal distribution, draw samples from N(Lambdas, P_csr^{-1})
+
+    Lambdas:    in shape (V, M)
+    P_csr:      in shape (V*M, V*M)
+    """
+
+    V, M = Lambdas.shape
+
+    Z = np.random.randn(V*M)
+    factor = cholesky(P_csr.tocsc())
+    X = factor.solve_Lt(Z).reshape(V, M)
+    return X + Lambdas
 
 #   ###############################################################################################
 #   mask the real data
@@ -160,7 +205,7 @@ def mask_brain(signal, median_radius = 1, numpass = 4, vol_idx = [0], least_size
                             autocrop=False,
                             vol_idx=vol_idx)
     
-    if least_size > 1 or keep_top is not None:                  # drop regions with size smaller than least_size 
+    if least_size >= 1 or keep_top is not None:                  # drop regions with size smaller than least_size 
 
         structure = ndimage.generate_binary_structure(3, 1)     # the last place can only be 1, 2, 3
                                                                 # 1, 2, 3 corresponds to 6, 18, 26 respectively
@@ -247,51 +292,62 @@ def contourf_compare(theta1, theta2, f_hat = None, qs = None, Sqs = None, f_true
             if qs is None or Sqs is None:
                 raise ValueError("At least one of f_hat, f_true, qs + Sqs must be provided.")
             else:
-                figure_width = 5
+                figure_width = 5*1
                 subs = 1
         else:
             if qs is None or Sqs is None:
-                figure_width = 5
+                figure_width = 5*1
                 subs = 1
             else:
-                figure_width = 10.5
+                figure_width = 10.5*1
                 subs = 2
     else:
         if f_true is None:
             if qs is None or Sqs is None:
-                figure_width = 5
+                figure_width = 5*1
                 subs = 1
             else:
-                figure_width = 10.5
+                figure_width = 10.5*1
                 subs = 2
         else:
             if qs is None or Sqs is None:
-                figure_width = 10.5
+                figure_width = 10.5*1
                 subs = 2
             else:
-                figure_width = 16
+                figure_width = 16*1
                 subs = 3
 
-    fig, axs = plt.subplots(1, subs, figsize=(figure_width, 4))
+    fig, axs = plt.subplots(1, subs, figsize=(figure_width, 4*1))
     if subs == 1:
         axs = [axs]
 
     sub_index = 0
     if f_hat is not None:
         f_hat_reshape = f_hat.reshape(theta11.shape, order='F')
-        contourplot = axs[sub_index].contourf(theta11, theta22, f_hat_reshape, levels=50, cmap='hot') #  viridis gist_earth
-        axs[sub_index].set_xlabel(r'D (${\mu m}^2/ms$)')
-        axs[sub_index].set_ylabel(r'R ($s^{-1}$)')
-        axs[sub_index].set_title('Recovered')
-        plt.colorbar(contourplot, ax=axs[sub_index])
+        contourplot = axs[sub_index].pcolormesh(theta11, theta22, f_hat_reshape, shading='nearest', cmap='jet')
+
+        # contourplot = axs[sub_index].contourf(theta11, theta22, f_hat_reshape, levels=50, cmap='jet') #  viridis gist_earth
+
+        # axs[sub_index].set_xscale('log')
+        # axs[sub_index].set_yscale('log')
+        axs[sub_index].set_xlabel(r'D (${\mu m}^2/ms$)', fontsize=12)
+        axs[sub_index].set_ylabel(r'R ($s^{-1}$)', fontsize=12)
+        axs[sub_index].set_title('Recovered', fontsize=12)
+        axs[sub_index].tick_params(axis='x', labelsize=12)
+        axs[sub_index].tick_params(axis='y', labelsize=12)
+
+        # if f_true is None:
+        #     plt.colorbar(contourplot, ax=axs[sub_index])
         sub_index += 1
 
     if f_true is not None:
-        contourplot_true = axs[sub_index].contourf(theta11, theta22, f_true.reshape(theta11.shape, order='F'), levels=50, cmap='hot')
-        axs[sub_index].set_xlabel(r'D (${\mu m}^2/ms$)')
-        axs[sub_index].set_ylabel(r'R ($s^{-1}$)')
-        axs[sub_index].set_title('True')
-        plt.colorbar(contourplot_true, ax=axs[sub_index])
+        contourplot_true = axs[sub_index].pcolormesh(theta11, theta22, f_true.reshape(theta11.shape, order='F'), shading='nearest', cmap='jet')
+        axs[sub_index].set_xlabel(r'D (${\mu m}^2/ms$)', fontsize=12)
+        axs[sub_index].set_ylabel(r'R ($s^{-1}$)', fontsize=12)
+        axs[sub_index].set_title('Ground truth', fontsize=12)
+        axs[sub_index].tick_params(axis='x', labelsize=12)
+        axs[sub_index].tick_params(axis='y', labelsize=12)
+        # plt.colorbar(contourplot_true, ax=axs[sub_index])
         sub_index += 1
     
     if qs is not None and Sqs is not None:
@@ -301,12 +357,14 @@ def contourf_compare(theta1, theta2, f_hat = None, qs = None, Sqs = None, f_true
         if f_true is not None:
             axs[sub_index].plot(get_Sqs(ker_mat, weights, f_true), 'x', markersize = 5, markeredgewidth=1, color = 'blue', alpha = 1, label = 'Ground truth')
         axs[sub_index].plot(get_Sqs(ker_mat, weights, f_hat), '.', markersize = 3, color = 'red', alpha = 1, label='Recovered')
-        axs[sub_index].set_ylabel('S(q)')
-        axs[sub_index].set_xlabel('q')
-        axs[sub_index].legend()
+        axs[sub_index].set_ylabel('S(q)', fontsize=12)
+        axs[sub_index].set_xlabel('q', fontsize=12)
+        axs[sub_index].tick_params(axis='x', labelsize=12)
+        axs[sub_index].tick_params(axis='y', labelsize=12)
+        axs[sub_index].legend(fontsize=12)
 
     if savepath is not None:
-        plt.savefig(savepath, format='pdf', bbox_inches='tight')
+        plt.savefig(savepath, format='pdf')
     plt.show()
 
 
@@ -327,7 +385,7 @@ def contourf_mask(theta1, theta2, f_hat, lin2idx, axis = 0, slice = 0):
     rows = shape[0]
     cols = shape[1]
 
-    fig, axs = plt.subplots(cols, rows, figsize=(1*rows, 1*cols)) 
+    fig, axs = plt.subplots(cols, rows, figsize=(2*rows, 2*cols)) 
     plt.subplots_adjust(wspace=0, hspace=0)
     theta11, theta22 = np.meshgrid(theta1, theta2)
 
@@ -345,13 +403,20 @@ def contourf_mask(theta1, theta2, f_hat, lin2idx, axis = 0, slice = 0):
                 ax.set_visible(False)
                 continue
             else:
-                ax.contourf(theta11, theta22, 
-                            f_hat[lin2idx[tuple(index)], :].reshape(theta11.shape, order='F'), 
-                            levels=50, cmap='hot')
+                ax.pcolormesh(theta11, theta22, 
+                              f_hat[lin2idx[tuple(index)], :].reshape(theta11.shape, order='F'),
+                              cmap='jet')
+
+                # ax.contourf(theta11, theta22, 
+                            # f_hat[lin2idx[tuple(index)], :].reshape(theta11.shape, order='F'), 
+                            # levels=50, cmap='jet')
+
+                # ax.set_xscale('log')
+                # ax.set_yscale('log')
                 ax.text(0.05, 0.95, lin2idx[tuple(index)], transform=ax.transAxes, 
-                            va='top', ha='left', color='white', fontsize=6)
-                ax.axhline(y=0, color='white', linestyle='-', linewidth=1.2)
-                ax.axvline(x=0, color='white', linestyle='-', linewidth=0.5)
+                            va='top', ha='left', color='white', fontsize=16)
+                ax.axhline(y=0.01, color='white', linestyle='-', linewidth=2)
+                ax.axvline(x=1.00, color='white', linestyle='-', linewidth=2)
                 ax.axis("off")
     # plt.savefig(os.path.expanduser('~/Desktop/MRI.png'), format='png')
     plt.show()

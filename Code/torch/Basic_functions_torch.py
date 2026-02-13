@@ -1,13 +1,16 @@
-
 import torch
 
 from scipy.sparse.linalg import cg, LinearOperator
 from scipy.sparse import csr_matrix
+from petsc4py import PETSc
 
-import cupy as cp
-import cupyx.scipy.sparse as cpx_sparse
-import cupyx.scipy.sparse.linalg as cpx_linalg
-from torch.utils.dlpack import to_dlpack, from_dlpack
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sparse
+    import cupyx.scipy.sparse.linalg as cpx_linalg
+    from torch.utils.dlpack import to_dlpack, from_dlpack
+except ModuleNotFoundError:
+    pass
 
 import numpy as np
 from dipy.segment.mask import median_otsu
@@ -45,18 +48,28 @@ def Cartesian(theta1, theta2):
     theta11, theta22 = torch.meshgrid(theta1, theta2, indexing='ij')
     thetas = torch.stack([theta11.flatten(), theta22.flatten()], dim=1)             # in shape (n1*n2, 2)
 
-    delta1 = torch.gradient(theta1)[0]                                              # in shape (n1,)
-    delta2 = torch.gradient(theta2)[0]                                              # in shape (n2,)
+    def delta(theta):
+        # given a series of points, divide the whole long space into n pieces without overlap and gaps
+        points = torch.cat([    theta[:1],  0.5 * (theta[:-1] + theta[1:]), theta[-1:]      ])
+        return points[1:] - points[:-1]
+    
+    delta1 = delta(theta1)                                                          # in shape (n1,)
+    delta2 = delta(theta2)                                                          # in shape (n2,)
 
     weights = torch.outer(delta1, delta2).reshape(-1) 
 
     return thetas, weights
 
-
 def kernel(qs, thetas):
     """
     This function computes the kernel matrix for the given qs and thetas.
     """
+
+    ######################################################################################################
+    thetas = thetas.clone()         ########################## Needed for Haldar's forward model
+    thetas[:, 1] = 1 / thetas[:, 1] ########################## Needed for Haldar's forward model
+    ######################################################################################################
+
     return torch.exp(- qs @ thetas.T)                                               # in shape (M, N). M = qs.shape[0], N = thetas.shape[0]
 
 def get_Sqs(ker_mat, weights, f_thetas, sigma = 0):
@@ -72,6 +85,30 @@ def get_Sqs(ker_mat, weights, f_thetas, sigma = 0):
     epsilon = torch.randn(size) * sigma
     return (f_thetas * weights) @ ker_mat.T + epsilon                               # in shape (M,) or shape (V, M)
 
+def get_Sqs_sampling(qs, samples, sigma = 0):
+    """
+    This function computes the results of a forward model, that is, the y in y = Ax.
+    It is calculated by using Monte Carlo method. So, samples are needed.
+    This function is equivalent to "kernel" function plus "get_Sqs"
+
+    qs:         in shape (M, 2)
+    samples:    in shape (S, 2) or shape (V, S, 2). S is the sample size
+    """
+    
+    if samples.dim() == 2:                                                          # in shape (S, 2)
+        samples = samples.unsqueeze(0)                                              # in shape (1, S, 2)
+
+    ######################################################################################################
+    samples = samples.clone()               ######################### Needed for Haldar's forward model
+    samples[:, :, 1] = 1 / samples[:, :, 1] ######################### Needed for Haldar's forward model
+    ######################################################################################################
+
+    Sqs = torch.mean(torch.exp(-torch.einsum('mi, vsi -> vms', qs, samples)), dim = 2) # in shape (V, M)
+
+    epsilon = torch.randn_like(Sqs) * sigma
+
+    return (Sqs + epsilon).squeeze()                                                # in shape (M,) or shape (V, M)
+
 #   ###############################################################################################
 #   mainly designed for comparing two pdfs
 #   ###############################################################################################
@@ -80,8 +117,8 @@ def compare_KL(f_num, f_den, weights):
     """
     This function computes the KL divergence between two pdfs and the orders matter.
     
-    f_num:      in shape (N, ), the pdf in the numerator in the KL divergence
-    f_den:      in shape (N, ), the pdf in the denominator in the KL divergence, no zero entries
+    f_num:      in shape (N, ) or shape (V, N), the pdf in the numerator in the KL divergence
+    f_den:      in shape (N, ) or shape (V, N), the pdf in the denominator in the KL divergence, no zero entries
     weights:    in shape (N, ), the weights of the quadrature
     """
     assert f_num.ndim == f_den.ndim, "Dimensions of f_num and f_den must match"
@@ -92,14 +129,27 @@ def compare_L2(f_a, f_b, weights=None):
     """
     This function computes the L2 distance between two pdfs and the orders do not matter.
     
-    f_a:        in shape (N, ), the pdf in the first argument
-    f_b:        in shape (N, ), the pdf in the second argument
+    f_a:        in shape (N, ) or shape (V, N), the pdf in the first argument
+    f_b:        in shape (N, ) or shape (V, N), the pdf in the second argument
     weights:    in shape (N, ), the weights of the quadrature. If None, it is assumed to be all ones.
     """
     if weights is None:
-        weights = torch.ones_like(f_a[0])
+        weights = torch.ones_like(f_a if f_a.ndim == 1 else f_a[0])
     assert f_a.ndim == f_b.ndim, "Dimensions of f_a and f_b must match"
     return torch.sqrt(torch.sum(weights * (f_a - f_b) ** 2, dim=0 if f_a.ndim == 1 else 1))
+
+def compare_He(f_a, f_b, weights=None):
+    """
+    This function computes the Hellinger distance between two pdfs and the orders do not matter.
+    
+    f_a:        in shape (N, ) or shape (V, N), the pdf in the first argument
+    f_b:        in shape (N, ) or shape (V, N), the pdf in the second argument
+    weights:    in shape (N, ), the weights of the quadrature. If None, it is assumed to be all ones.
+    """
+    if weights is None:
+        weights = torch.ones_like(f_a if f_a.ndim == 1 else f_a[0])
+    assert f_a.ndim == f_b.ndim, "Dimensions of f_a and f_b must match"
+    return torch.sqrt(torch.sum(weights * (torch.sqrt(f_a) - torch.sqrt(f_b)) ** 2, dim=0 if f_a.ndim == 1 else 1))/torch.sqrt(torch.tensor(2.0))
     
 #   ###############################################################################################
 #   inverse or solve a linear system with a symmetric positive definite matrix
@@ -128,34 +178,30 @@ def cupy_solver(A_csr, y, rtol=1e-10, atol=1e-50, maxiter=1000):
     A_csr is high dimensional spd.
     """
 
-    # --- Convert torch -> cupy (zero-copy via DLPack) ---
+    # Convert torch to cupy, and make A_csr CuPy CSR matrix
     data_cp    = cp.from_dlpack(to_dlpack(A_csr.values()))
     indices_cp = cp.from_dlpack(to_dlpack(A_csr.col_indices()))
     indptr_cp  = cp.from_dlpack(to_dlpack(A_csr.crow_indices()))
-    y_cp       = cp.from_dlpack(to_dlpack(y))
 
     n = int(indptr_cp.size - 1)
-    
-    # --- Build CuPy CSR matrix ---
+
     A_cp = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=(n, n))
 
-    # --- Simple Jacobi preconditioner (safe for SPD) ---
+    y_cp = cp.from_dlpack(to_dlpack(y))
+    
+    # Simple Jacobi preconditioner
     D = A_cp.diagonal()
     D = cp.where(D == 0, 1.0, D)
     Minv = 1.0 / D
+    M = cpx_linalg.LinearOperator((n, n), matvec=lambda x: Minv * x, dtype=A_cp.dtype)
 
-    def apply_M(x):
-        return Minv * x
-
-    M = cpx_linalg.LinearOperator((n, n), matvec=apply_M, dtype=A_cp.dtype)
-
-    # --- Solve with Conjugate Gradient (CG) ---
+    # Solve with Conjugate Gradient 
     x_cp, info = cpx_linalg.cg(A_cp, y_cp, tol=rtol, atol=atol, maxiter=maxiter, M=M)
 
     if info != 0:
         raise RuntimeError(f"CG did not converge (info={info})")
 
-    # --- Convert back to torch (zero-copy if possible) ---
+    # Convert back to torch (zero-copy if possible) ---
     try:
         # <-- use the snake_case to_dlpack() to avoid the deprecation warning
         x_torch = from_dlpack(x_cp.to_dlpack())
@@ -182,9 +228,7 @@ def scipy_solver(A_csr, y, rtol=1e-10, atol = 1e-50, maxiter=1000):
     D = A_scipy.diagonal()
     D[D == 0] = 1.0
     Minv = 1.0 / D
-    def apply_M(x):
-        return Minv * x
-    M = LinearOperator((n, n), matvec=apply_M, dtype=A_scipy.dtype)
+    M = LinearOperator((n, n), matvec = lambda x: Minv * x, dtype=A_scipy.dtype)
 
     # --- solve Ax = b using Conjugate Gradient ---
     x_np, info = cg(A_scipy, y_np, rtol = rtol, atol = atol, maxiter = maxiter, M = M)
@@ -192,6 +236,42 @@ def scipy_solver(A_csr, y, rtol=1e-10, atol = 1e-50, maxiter=1000):
     # --- convert back to torch tensor ---
     x = torch.from_numpy(x_np).to(y.dtype).to(y.device)
     return x
+
+def PETSc_solver(A_csr, y, rtol = 1e-10, atol = 1e-50, maxiter = 1000):
+    """
+    This function solves the linear system Ax = y using cg method from PETSc package.
+    Here the solver is designed for huge dimension spd A.
+    The form of A is scipy csr sparse matrix.
+    This package so far only supports CPU.
+    But all the other functions are designed for CUDA. So, it needs to first convert the data into scipy or numpy form.
+    """
+    crow = A_csr.crow_indices().cpu().numpy().astype(np.int32, copy=False)
+    col  = A_csr.col_indices().cpu().numpy().astype(np.int32, copy=False)
+    vals = A_csr.values().cpu().numpy()
+    n = A_csr.size(0)
+
+    A_PETSc = PETSc.Mat().createAIJ( size=(n, n), csr=(crow, col, vals) )
+    A_PETSc.assemblyBegin()
+    A_PETSc.assemblyEnd()
+
+    b = PETSc.Vec().createWithArray(  y.cpu().numpy()  )
+
+    # ---------- main step to solve the linear equation ----------
+
+    x = b.duplicate()
+
+    ksp = PETSc.KSP().create()
+    ksp.setOperators(A_PETSc)
+    ksp.setType('cg')               # cg, minres  (cg method is one of many methods to solve linear system)
+    ksp.getPC().setType('hypre')    # gamg, hypre, .....
+    ksp.setTolerances(rtol=rtol, atol=atol, max_it=maxiter)
+    ksp.setFromOptions()
+    ksp.solve(b, x)
+
+    sol = x.getArray()
+    sol = torch.from_numpy(sol).to(y.dtype).to(y.device)
+
+    return sol
 
 
 #   ###############################################################################################

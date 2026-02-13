@@ -9,51 +9,7 @@ sys.path.append(str(Path.home() / "Projects" / "MaxEnt" / "Code"))
 import Basic_functions
 importlib.reload(Basic_functions)
 from Basic_functions import kernel, get_Sqs, compare_KL, chol_solver, PETSc_solver
-from D2_admm_solver import data_check, loss_function, f_thetas_hat, negative_dual_function
-
-def gradient_hessian(Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, f0, normalize, rtol, atol, maxiter):
-    """
-    This function computes the gradient and the hessian matrix for the negative dual function.
-
-    Lambdas:        in shape (V, M)
-    ker_mat:        in shape (M, N)
-    ker_prod:       in shape (M, M, N)
-    weights:        in shape (N, )
-    Sqs:            in shape (V, M)
-    f0:             in shape (V, N)
-    """
-    V = Sqs.shape[0]        # number of voxels
-    M = ker_mat.shape[0]    # number of qs
-    N = ker_mat.shape[1]    # number of thetas
-        
-    rSqs = Sqs.ravel(order='C')                                                                 # in shape (V*M, )
-    rLambdas = Lambdas.ravel(order='C')                                                         # in shape (V*M, )
-
-    Sigma_inv_diag = 1 / (sigma**2) * np.ones(V*M)                                              # in shape (V*M, )
-    middle_matrix = sp.diags(Sigma_inv_diag, format='csr') + R_csr                              # in shape (V*M, V*M)
-    side_vector = Sigma_inv_diag * rSqs + rLambdas                                              # in shape (V*M, )
-
-    Sigma_diag = (sigma**2) * np.ones(V*M)                                                      # in shape (V*M, )
-
-    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize = normalize)                  # in shape (V, N)
-    f_weights = f_hat * weights                                                                 # in shape (V, N)
-    grad1 = f_weights @ ker_mat.T                                                               # in shape (V, M)
-    if (R_csr.nnz == 0):
-        grad2 = rSqs + np.diag(Sigma_diag) @ rLambdas
-    else:
-        grad2 = PETSc_solver(middle_matrix, side_vector, rtol, atol, maxiter)                   # in shape (V*M, )
-    gradient = - grad1.ravel(order='C') + grad2                                                 # in shape (V*M, )
-
-    hess_blocks = np.tensordot(f_weights, ker_prod, axes=([1], [2]))                            # in shape (V, M, M)
-    hess = sp.block_diag([hess_blocks[i] for i in range(V)], format='csr')                      # in shape (V*M, V*M)
-
-    if normalize:
-        hess = hess - sp.csr_matrix(np.outer(grad1.ravel(order='C'), grad1.ravel(order='C')))   # in shape (V*M, V*M)
-    if (R_csr.nnz == 0):
-        hess = hess + sp.diags(Sigma_diag, format = 'csr')                                      # in shape (V*M, V*M)
-    else:
-        hess = hess + sp.csr_matrix(chol_solver(middle_matrix.toarray()))                       # in shape (V*M, V*M)
-    return gradient, hess
+from D2_admm_solver import data_check, loss_function, f_thetas_hat, gradient_hessian, negative_dual_function
 
 def Newton_Armijo(  qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = False,
                     Lambdas = None, 
@@ -107,10 +63,7 @@ def Newton_Armijo(  qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize
     while True:
         
         grad, hess = gradient_hessian(  Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, f0, normalize, 
-                                        cg_rtol, cg_atol, cg_maxiter)                           # in shape (V*M, ), (V*M, V*M)
-        
-        vals = np.sort(sp.linalg.eigsh(hess, k=24)[0])
-        print(vals[0], vals[-1]) 
+                                        cg_rtol, cg_atol, cg_maxiter)                       # in shape (V*M, ), (V*M, V*M)
 
         direction = - PETSc_solver(hess, grad, cg_rtol, cg_atol, cg_maxiter)
 

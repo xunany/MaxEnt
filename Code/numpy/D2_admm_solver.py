@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 
-from Basic_functions import kernel, get_Sqs, chol_solver, PETSc_solver, compare_KL
+from Basic_functions import kernel, get_Sqs, compare_KL, chol_solver, PETSc_solver
 
 def data_check(qs, thetas, weights, Sqs, sigma, R_csr, f0, f_hat = None):
     """
@@ -160,15 +160,79 @@ def negative_dual_function(Lambdas, ker_mat, weights, Sqs, sigma, R_csr, f0, nor
 
     return first_term + second_term
 
+def gradient_hessian(Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, f0, normalize, rtol, atol, maxiter, blocked = False):
+    """
+    This function computes the gradient and the hessian matrix for the negative dual function.
+    It has no use to solving ADMM. It can be used in direct Newton method though
+    It can also be used in returning the blocked hessian matrix given the optimum of Lambdas,
+    which is needed in generalized corss validation.
+
+    Lambdas:    in shape (V, M)
+    ker_mat:    in shape (M, N)
+    ker_prod:   in shape (M, M, N)
+    weights:    in shape (N, )
+    Sqs:        in shape (V, M)
+    f0:         in shape (V, N)
+
+    blocked:    if True, only return blocked hess part by assuming Lambdas is already optimal and gradient nearly == 0.
+                And no matter what R_csr is, it will be treated as all zeros, i.e., no spatial smoothness is considered.
+    """
+    V = Sqs.shape[0]        # number of voxels
+    M = ker_mat.shape[0]    # number of qs
+    N = ker_mat.shape[1]    # number of thetas
+
+    Sigma_diag = (sigma**2) * np.ones(V*M)                                                      # in shape (V*M, )
+
+    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize = normalize)                  # in shape (V, N)
+    f_weights = f_hat * weights                                                                 # in shape (V, N)
+    grad1 = f_weights @ ker_mat.T                                                               # in shape (V, M)
+                                      # in shape (V*M, )
+
+    hess_blocked = np.tensordot(f_weights, ker_prod, axes=([1], [2]))                           # in shape (V, M, M)
+
+    if normalize:
+        hess_blocked -= grad1[:, :, None] * grad1[:, None, :]                                   # in shape (V, M, M)
+
+    if blocked:
+        hess_blocked += np.eye(M)[None, :, :] * Sigma_diag.reshape(V, M)[:, :, None]            # in shape (V, M, M)
+        return hess_blocked
+    
+    rSqs = Sqs.ravel(order='C')                                                                 # in shape (V*M, )
+    rLambdas = Lambdas.ravel(order='C')                                                         # in shape (V*M, )
+
+    Sigma_inv_diag = 1 / (sigma**2) * np.ones(V*M)                                              # in shape (V*M, )
+    middle_matrix = sp.diags(Sigma_inv_diag, format='csr') + R_csr                              # in shape (V*M, V*M)
+    side_vector = Sigma_inv_diag * rSqs + rLambdas                                              # in shape (V*M, )
+    
+    if (R_csr.nnz == 0):
+        grad2 = rSqs + np.diag(Sigma_diag) @ rLambdas
+    else:
+        grad2 = PETSc_solver(middle_matrix, side_vector, rtol, atol, maxiter)                   # in shape (V*M, )
+
+    gradient = - grad1.ravel(order='C') + grad2           
+
+    hess = sp.block_diag([hess_blocked[i] for i in range(V)], format='csr')                     # in shape (V*M, V*M)
+
+    if (R_csr.nnz == 0):
+        hess = hess + sp.diags(Sigma_diag, format = 'csr')                                      # in shape (V*M, V*M)
+    else:
+        hess = hess + sp.csr_matrix(chol_solver(middle_matrix.toarray()))                       # in shape (V*M, V*M)
+    return gradient, hess
+
 
 def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True, Lambdas = None, 
             beta = 0.5, c = 1e-4, epsilon = 1e-8, tol = 1e-6, maxiter = 10, 
             cg_rtol = 1e-10, cg_atol = 1e-50, cg_maxiter = 1000, 
             rho = 1.0, rho_ratio = 3, dynamic_rho = False,
-            admm_tol = 1e-8, admm_maxiter = 100): 
+            admm_tol = 1e-8, admm_maxiter = 100, 
+            return_hess = False): 
     
     """
     rho_ratio:  should be strictly greater than 1
+    keep_hess:  If use generalized cross validation, hess needs to be returned.
+                If do voxel-wise gcv for just alpha(s), set R_csr to empty please, and it returns "blocked_hess".
+                If do gcv for both (alpha, if needed) beta, no requirement to R_csr, and it still returns "blocked_hess",
+                but notice that "blocked hess" is not the final hess in that case.
     """
     
     def dist_obj(Lambdas, zs, us, rho, ker_mat, weights, f0, normalize):
@@ -201,7 +265,7 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         f_weights = f_hat * weights                                                     # in shape (V, N)
         grad = - f_weights @ ker_mat.T + rho * (Lambdas - zs + us)                      # in shape (V, M)
 
-        hess = np.tensordot(f_weights, ker_prod, axes=([1], [2]))                       # in shape (V, M, M) vn, ijn -> vij
+        hess = np.tensordot(f_weights, ker_prod, axes=([1], [2]))                       # in shape (V, M, M)
         I = np.eye(M).reshape(1, M, M)                                                  # in shape (V, M, M)
         hess = hess + rho * I                                                           # in shape (V, M, M)
 
@@ -288,7 +352,7 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
     qs, thetas, weights, Sqs, sigma, R_csr, f0, _ = data_check(qs, thetas, weights, Sqs, sigma, R_csr, f0)
 
     ker_mat = kernel(qs, thetas)                        # in shape (M, N)
-    ker_prod = ker_mat[:, None, :] * ker_mat[None, :, :]# in shape (M, M, N) mn,in->min
+    ker_prod = ker_mat[:, None, :] * ker_mat[None, :, :]# in shape (M, M, N)
 
     if Lambdas is None:
         Lambdas = np.ones((V, M))
@@ -324,10 +388,15 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         """
         update zs -----------------------------------------------------------------------------------------------------
         """
+        if (R_csr.nnz == 0):
+            vec_y = rho / (sigma**2) * (Lambdas.ravel(order='C') + us) - ( Sqs.ravel(order='C') / (sigma**2) )
+            zs_new = vec_y / (1.0 + rho / (sigma**2))
+
+        else:
         
-        mat_A = sp.eye(V * M, format='csr') + rho*(Sigma_inv + R_csr)
-        vec_y = rho*(Sigma_inv + R_csr) @ (Lambdas.ravel(order='C') + us) - Sigma_inv @ Sqs.ravel(order='C')
-        zs_new = PETSc_solver(mat_A, vec_y, cg_rtol, cg_atol, cg_maxiter)
+            mat_A = sp.eye(V * M, format='csr') + rho*(Sigma_inv + R_csr)
+            vec_y = rho*(Sigma_inv + R_csr) @ (Lambdas.ravel(order='C') + us) - Sigma_inv @ Sqs.ravel(order='C')
+            zs_new = PETSc_solver(mat_A, vec_y, cg_rtol, cg_atol, cg_maxiter)
 
         """
         check ---------------------------------------------------------------------------------------------------------
@@ -373,36 +442,46 @@ def admm(   qs, thetas, weights, Sqs, sigma, R_csr, f0 = None, normalize = True,
         end -----------------------------------------------------------------------------------------------------------
         """
 
+    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize)  
+
     Newton_history = Newton_history[:, :loop]           # Unused part of Newton_history will be cropped
 
-    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize)  
     history = [obj_history, primal_history, dual_history, rho_history, Newton_history]  
+
+    if return_hess:
+        final_blocked_hess = gradient_hessian(  Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, 
+                                                f0, normalize, cg_rtol, cg_atol, cg_maxiter, blocked = True)
+        history.append(final_blocked_hess)
 
     return Lambdas, f_hat, history                  
 
-def uncertainty(Lambdas, qs, thetas, weights, Sqs, sigma, R, f0, normalize):
-
-    qs, thetas, weights, Sqs, sigma, R, f0, _ = data_check(qs, thetas, weights, Sqs, sigma, R, f0)
+def uncertainty(Lambdas, qs, thetas, weights, Sqs, sigma, R_csr, f0, normalize, 
+                cg_rtol = 1e-10, cg_atol = 1e-50, cg_maxiter = 1000):
 
     V = Sqs.shape[0]
     M = Sqs.shape[1]
     N = thetas.shape[0]
 
-    ker_mat = kernel(qs, thetas)                                                                                    # in shape (M, N)
-    ker_prod = np.einsum('ik,jk->ijk', ker_mat, ker_mat)                                                            # in shape (M, M, N)
-    f_hat = f_thetas_hat(Lambdas, ker_mat, weights, f0, normalize = normalize)                                      # in shape (V, N)
-    Gamma = np.zeros((V*M, V*M))                                                                                    # in shape (V*M, V*M)
-    for i in range(V):
-        Gamma[i*M:(i+1)*M, i*M:(i+1)*M] = np.einsum('ijn,n->ij', ker_prod, f_hat[i, :] * weights)                   # hess in shape (V*M, V*M)
-    if normalize:
-        grad = np.einsum('vn,mn->vmn', f_hat, ker_mat)                                                              # in shape (V, M, N)
-        grad = np.einsum('vmn,n->vm', grad, weights)                                                                # in shape (V, M)
-        Gamma = Gamma - grad.reshape((-1, 1), order='C') @ grad.reshape((1, -1), order='C')                         # in shape (V*M, V*M)
-    
-    Sigma_inv = np.eye(V*M) * 1 / (sigma**2)                                                                        # in shape (V*M, V*M)
-    Sigma = np.eye(V*M) * (sigma**2)                                                                                # in shape (V*M, V*M)
+    if f0 is None:
+        f0 = 1/np.sum(weights)*np.ones((V, N))                                                                      # in shape (V, N)
 
-    precision = Gamma @ (Sigma_inv + 2 * R + R @ Sigma @ R) @ Gamma + 2 * Gamma @ (np.eye(V*M) + R @ Sigma) + Sigma # in shape (V*M, V*M)
+    qs, thetas, weights, Sqs, sigma, R_csr, f0, _ = data_check(qs, thetas, weights, Sqs, sigma, R_csr, f0)
+
+    ker_mat = kernel(qs, thetas)                                                                                    # in shape (M, N)
+    ker_prod = ker_mat[:, None, :] * ker_mat[None, :, :]   
+
+    blocked_Gamma = gradient_hessian(   Lambdas, ker_mat, ker_prod, weights, Sqs, sigma, R_csr, 
+                                        f0, normalize, cg_rtol, cg_atol, cg_maxiter, blocked = True)                # in shape (V, M, M)
+    
+    Gamma = sp.block_diag(blocked_Gamma, format="csr")                                                              # in shape (V*M, V*M)
+
+    Sigma     = sp.diags(sigma**2, format="csr")                                                                    # in shape (V*M, V*M)
+    Sigma_inv = sp.diags(1.0 / sigma**2, format="csr")                                                              # in shape (V*M, V*M)
+    I         = sp.eye(V*M, format="csr")                                                                           # in shape (V*M, V*M)
+
+    precision = (   Gamma @ (Sigma_inv + 2 * R_csr + R_csr @ Sigma @ R_csr) @ Gamma 
+                  + 2 * Gamma @ (I + R_csr @ Sigma) 
+                  + Sigma       )                                                                                   # in shape (V*M, V*M)
 
     # # ---------------------------------------------------------------------------------------------
     # # From the important truth that R = 0 !

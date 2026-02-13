@@ -1,8 +1,11 @@
 # The following folders will be ignored---------------------------------
 
-Data/
+# Data/
+Data/*
+!Data/Weighted_com_roi_5slice_rewei_final.mat
 Notes/
 Scripts/
+Graphs/
 
 
 # The following cache will be ignored-----------------------------------
